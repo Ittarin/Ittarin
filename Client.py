@@ -690,30 +690,27 @@ def receive_feedback(matlab_socket):
         print("データ受信開始")
         received_data = can.Receive(0x201)
         if received_data and len(received_data) == 8:
+            # Process received CAN data
             mechanical_angle = (int(received_data[0], 16) << 8) | int(received_data[1], 16)
-
-            # 角度を deg → rad に変換
             angle_in_degrees = (mechanical_angle / 8191.0) * 360.0
-            angle_in_radians = angle_in_degrees * math.pi / 180.0
+            current_angle_rad = angle_in_degrees * math.pi / 180.0  # Fix assignment
 
+            # Print and process additional data
             speed = (int(received_data[2], 16) << 8) | int(received_data[3], 16)
-            adjusted_speed = speed / gear_ratio
             torque_current = (int(received_data[4], 16) << 8) | int(received_data[5], 16)
             temperature = int(received_data[6], 16)
 
-            print(f"フィードバック Angle: {current_angle_rad:.4f} rad, Speed: {speed:.2f} RPM, "
-                  f"Torque Current: {torque_current}, Temperature: {temperature} °C")
+            print(f"フィードバック: Angle: {current_angle_rad:.4f} rad, Speed: {speed}, "
+                  f"Torque Current: {torque_current}, Temperature: {temperature}")
 
-            # MATLABにデータを送信（誤差を含める）
+            # Send feedback to MATLAB
             error = target_angle - current_angle_rad
-            matlab_message = f"{current_angle_rad:.4f},{error:.4f},{speed:.2f},{torque_current},{temperature}\n"
+            matlab_message = f"{current_angle_rad:.4f},{error:.4f},{speed},{torque_current},{temperature}\n"
             matlab_socket.sendall(matlab_message.encode())
-            print(f"MATLABに送信: {matlab_message.strip()}")
-
         else:
-            print("データが無効または受信されていません")
+            print("無効なフィードバックデータ")
     except Exception as e:
-        print("受信エラー:", e)
+        print(f"受信エラー: {e}")
     
 # メインループ（MATLAB送信機能を追加）
 def loop(client_socket, matlab_socket):
