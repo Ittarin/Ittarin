@@ -700,8 +700,6 @@ def receive_feedback(matlab_socket):
             adjusted_speed = speed / gear_ratio
             torque_current = (int(received_data[4], 16) << 8) | int(received_data[5], 16)
             temperature = int(received_data[6], 16)
-            
-            current_angle_rad = current_angle_rad
 
             print(f"フィードバック Angle: {current_angle_rad:.4f} rad, Speed: {speed:.2f} RPM, "
                   f"Torque Current: {torque_current}, Temperature: {temperature} °C")
