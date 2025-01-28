@@ -584,23 +584,27 @@ can = MCP2515()
 # ギア比の設定
 gear_ratio = 3591.0 / 187.0  # ギア比
 
+# 慣性モーメントとトルク定数
+J_base = 0.002086621926  # 本体の慣性モーメント (kg·m^2)
+Kt = 0.3  # トルク定数 (Nm/A)
+
 # PID制御パラメータ
-Kp = 0.3  # 比例ゲイン
-Ki = 0.0   # 積分ゲイン
-Kd = 0.5   # 微分ゲイン
+Kp = 3.0  # 比例ゲイン
+Ki = 1.0  # 積分ゲイン
+Kd = 1.0   # 微分ゲイン
 
 # PID制御用変数
 last_error = 0
 integral = 0
 
 # 目標角度（rad）
-target_angle = 30.0 * math.pi / 180.0  # 30度 → rad
+target_angle = 90.0 * math.pi / 180.0  # 30度 → rad
 
 # 誤差が十分小さい場合のしきい値（rad）
-ERROR_THRESHOLD = 0.01  # 目標角度との差が ±0.01 rad 以下なら電流を流さない
+ERROR_THRESHOLD = 0.2  # 目標角度との差が ±0.01 rad 以下なら電流を流さない
 
 # 制御ループでのタイムステップ
-time_step = 0.1  # 秒
+time_step = 0.01  # 秒
 
 # サーバーのIPアドレスとポート番号
 SERVER_IP = '192.168.11.23'
@@ -616,31 +620,26 @@ def setup():
     can.Init("1000KBPS")
     print("CANバス初期化完了")
 
-# 電流値を送信する関数
 def send_current_command(current_value):
     try:
-        current_value = max(min(current_value, 16384), -16384)
+        # 送信する電流値を整数化（int に変換）
+        current_value = int(max(min(current_value, MAX_CONTROL), -MAX_CONTROL))
+ 
+        print(f"送信する電流値: {current_value}")
+
+        # CANデータ作成（整数型に変換した後にビットシフト）
         can_data = [
-            (current_value >> 8) & 0xFF,
+            (current_value >> 8) & 0xFF,  # int 型であればビットシフト可能
             current_value & 0xFF,
             0, 0, 0, 0, 0, 0
         ]
+
+        # 送信処理
         can.Send(0x200, can_data, len(can_data))
         print("送信するCANメッセージ:", [hex(byte) for byte in can_data])
-    except Exception as e:
-        print("送信エラー:", e)
 
-# サーバーから角度データを受信する関数（radのまま処理）
-def receive_from_server(client_socket):
-    try:
-        data = client_socket.recv(1024)
-        if data:
-            current_angle_rad = float(data.decode().strip())  # 受信データは既にrad表記
-            print(f"サーバーから受信した角度データ: {current_angle_rad:.4f} rad")
-            return current_angle_rad
     except Exception as e:
-        print(f"サーバーからデータ受信エラー: {e}")
-    return None
+        print(f"送信エラー: {e}")
 
 # MATLABにデータを送信するためのソケットを作成して接続
 def connect_to_matlab():
@@ -651,7 +650,9 @@ def connect_to_matlab():
     return matlab_socket
 
 # 最大制御信号（出力電流）を制限
-MAX_CONTROL = 600  # 最大5000に制限（以前は16384）
+MAX_CONTROL = 16384  # 最大5000に制限（以前は16384）
+# 最大積分項（積分の暴走を防ぐ）
+MAX_INTEGRAL = 500  # 必要に応じて調整
 
 # PID制御関数
 def pid_control(target, current):
@@ -675,93 +676,123 @@ def pid_control(target, current):
 
     # 制御信号を計算
     control_signal = Kp * error + Ki * integral + Kd * derivative
+    
+    # 制御信号を制約（上限）
+    control_signal = max(min(control_signal, MAX_CONTROL), -MAX_CONTROL)
+    required_torque = -J_base * control_signal
+    required_current = ((required_torque / Kt) / 20.0) * 16384
 
     # 前回の誤差を更新
     last_error = error
-    
-    # 制御信号をハードウェアの限界にクランプ
-    control_signal = max(min(control_signal, MAX_CONTROL), -MAX_CONTROL)
 
     return control_signal, error  # 誤差も返す
 
-# フィードバックデータを受信する関数（deg → rad に変換）
-def receive_feedback(matlab_socket):
+    return None
+
+def receive_from_server(client_socket):
+    try:
+        data = client_socket.recv(1024)
+        if not data:
+            print("サーバーからのデータが空です")
+            return None
+
+        decoded_data = data.decode().strip()  # 余計な空白や改行を削除
+        print(f"受信データ: {repr(decoded_data)}")  # デバッグ用
+
+        # 改行が含まれる場合は、最初のデータだけを使用
+        first_value = decoded_data.split("\n")[0]  
+
+        return float(first_value)  # 数値変換
+
+    except ValueError:
+        print(f"データ変換エラー: 受信データが数値として解釈できません -> {repr(decoded_data)}")
+    except Exception as e:
+        print(f"サーバーからデータ受信エラー: {e}")
+
+    return None
+
+# フィードバックデータを受信し返す（MATLAB送信は loop() で実施）
+def receive_feedback():
     try:
         print("データ受信開始")
         received_data = can.Receive(0x201)
         if received_data and len(received_data) == 8:
-            # Process received CAN data
             mechanical_angle = (int(received_data[0], 16) << 8) | int(received_data[1], 16)
             angle_in_degrees = (mechanical_angle / 8191.0) * 360.0
-            current_angle_rad = angle_in_degrees * math.pi / 180.0  # Fix assignment
-
-            # Print and process additional data
             speed = (int(received_data[2], 16) << 8) | int(received_data[3], 16)
+            adjusted_speed = speed / gear_ratio
             torque_current = (int(received_data[4], 16) << 8) | int(received_data[5], 16)
             temperature = int(received_data[6], 16)
+            
+            print(f"Angle: {angle_in_degrees:.2f} deg, Speed: {speed:.2f} RPM, "
+                  f"Torque Current: {torque_current}, Temperature: {temperature} °C")
 
-            print(f"フィードバック: Angle: {current_angle_rad:.4f} rad, Speed: {speed}, "
-                  f"Torque Current: {torque_current}, Temperature: {temperature}")
-
-            # Send feedback to MATLAB
-            error = target_angle - current_angle_rad
-            matlab_message = f"{current_angle_rad:.4f},{error:.4f},{speed},{torque_current},{temperature}\n"
-            matlab_socket.sendall(matlab_message.encode())
+            return speed, torque_current, temperature
         else:
-            print("無効なフィードバックデータ")
+            print("データが無効または受信されていません")
+            return 0, 0, 0  # エラー時はゼロを返す
     except Exception as e:
-        print(f"受信エラー: {e}")
-    
-# メインループ（MATLAB送信機能を追加）
+        print("受信エラー:", e)
+        return 0, 0, 0
+
+# メインループ（MATLAB にすべてのデータを送信 & シェルに表示）
 def loop(client_socket, matlab_socket):
     print("ループ開始")
 
-    # 最初に固定電流値を送信
-    target_current = 600  # 送信する電流値
-    print("電流値送信中...")
-    send_current_command(target_current)
-    print("電流値送信完了")
-
     # サーバーからの角度データを取得
-    current_angle_rad = receive_from_server(client_socket)
+    current_angle_rad = -receive_from_server(client_socket)
 
     if current_angle_rad is not None:
+        # シェルに受信データを表示
+        print("\n====== サーバーから受信したデータ ======")
+        print(f"角度 (current_angle_rad): {current_angle_rad:.4f} rad")
+        print("====================================\n")
+
         print(f"現在の角度: {current_angle_rad:.4f} rad")
 
-        # PID制御を実行して制御信号を計算
+        # PID制御を実行して制御信号（トルク制御値）を計算
         control_signal, error = pid_control(target_angle, current_angle_rad)
+        required_torque = -J_base * control_signal
+        required_current = ((required_torque / Kt) / 20.0) * 16384
 
         # 誤差が小さい場合は電流を流さない
         if abs(error) < ERROR_THRESHOLD:
             integral = 0
-            control_signal = 0
+            required_current = 0
             print("誤差が小さいため電流を流しません")
 
-        control_signal = max(min(control_signal, 16384), -16384)  # 範囲制限
-        
+        # 電流値を制約（最大電流値を超えないように）
+        required_current = max(min(required_current, MAX_CONTROL), -MAX_CONTROL)
+
         # 誤差が小さい場合（±ERROR_THRESHOLD内）なら電流送信を停止
         if abs(error) < ERROR_THRESHOLD:
             print("目標角に到達したため電流送信を停止")
         else:
-            print(f"PID制御信号: {control_signal:.2f}, 誤差: {error:.4f} rad")
-            send_current_command(control_signal)
+            print(f"PID制御信号: {control_signal:.2f}, 必要トルク: {required_torque:.4f} Nm, 電流値: {required_current:.2f} A, 誤差: {error:.4f} rad")
+            send_current_command(required_current)
 
-        # MATLABに誤差データを送信
+        # フィードバックデータ受信
+        print("フィードバック受信中...")
+        speed, torque_current, temperature = receive_feedback()
+        print("フィードバック受信完了")
+
+        # MATLAB にすべてのデータを送信
         try:
-            matlab_socket.sendall(f"{error:.4f}\n".encode())
-            print(f"MATLABに送信した誤差データ: {error:.4f} rad")
+            matlab_message = f"{current_angle_rad:.4f},{error:.4f},{speed:.2f},{torque_current},{temperature}\n"
+            matlab_socket.sendall(matlab_message.encode())
+
+            # シェルに MATLAB へ送信するデータを表示
+            print("\n===== MATLAB に送信するデータ =====")
+            print(f"角度: {current_angle_rad:.4f} rad")
+            print(f"誤差: {error:.4f} rad")
+            print(f"速度: {adjusted_speed:.2f} RPM")
+            print(f"トルク電流: {torque_current}")
+            print(f"温度: {temperature} °C")
+            print("=================================\n")
+
+            print(f"MATLABに送信: {matlab_message.strip()}")
         except Exception as e:
             print(f"MATLABへの送信エラー: {e}")
-
-        # PID制御信号を電流値として送信
-        print("PID制御による電流値送信中...")
-        send_current_command(control_signal)
-        print("PID制御による電流値送信完了")
-
-    # フィードバックデータ受信（MATLABに送信）
-    print("フィードバック受信中...")
-    receive_feedback(matlab_socket)
-    print("フィードバック受信完了")
 
     # 制御ループの遅延
     time.sleep(0.1)
@@ -769,6 +800,7 @@ def loop(client_socket, matlab_socket):
 # メイン実行部分
 if __name__ == "__main__":
     setup()
+    
 
     # サーバー（Pico）に接続
     client_socket = socket.socket()
@@ -786,6 +818,5 @@ if __name__ == "__main__":
     finally:
         client_socket.close()
         matlab_socket.close()
-
 
 
